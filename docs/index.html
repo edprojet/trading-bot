@@ -790,7 +790,10 @@ function updateSystemStatus({ alpacaOk, supabaseOk, lastSnapshot, marketOpen }) 
     supabaseOk ? 'Supabase — OK' : 'Supabase — Erreur'
   );
 
-  document.getElementById('sysBotCycle').style.display = marketOpen ? '' : 'none';
+  ['sysBotCycle', 'sysBotCycleM'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = marketOpen ? '' : 'none';
+  });
   if (!marketOpen) return;
   if (!lastSnapshot) {
     setChip('sysBotCycle', 'warn', 'Bot — Aucun cycle');
