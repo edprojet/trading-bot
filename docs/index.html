@@ -259,6 +259,15 @@
       font-size: 13px;
       line-height: 1.7;
       color: var(--text);
+      max-height: 280px;
+      overflow-y: auto;
+      padding-right: 6px;
+      mask-image: linear-gradient(to bottom, black 80%, transparent 100%);
+      -webkit-mask-image: linear-gradient(to bottom, black 80%, transparent 100%);
+    }
+    .analysis-content:hover {
+      mask-image: none;
+      -webkit-mask-image: none;
     }
 
     .analysis-content strong, .analysis-content b {
