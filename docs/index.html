@@ -796,14 +796,12 @@ function updateSystemStatus({ alpacaOk, supabaseOk, lastSnapshot, marketOpen }) 
   });
   if (!marketOpen) return;
   if (!lastSnapshot) {
-    setChip('sysBotCycle', 'warn', 'Bot — Aucun cycle');
+    setChip('sysBotCycle', 'err', 'Bot — Aucun cycle');
     return;
   }
   const ageMin = Math.round((Date.now() - new Date(lastSnapshot.created_at)) / 60000);
-  if (ageMin < 35) {
+  if (ageMin <= 40) {
     setChip('sysBotCycle', 'ok', `Bot — cycle il y a ${ageMin}m`);
-  } else if (ageMin < 90) {
-    setChip('sysBotCycle', 'warn', `Bot — cycle il y a ${ageMin}m`);
   } else {
     setChip('sysBotCycle', 'err', `Bot — inactif depuis ${ageMin}m`);
   }
