@@ -186,6 +186,16 @@ async function getNews(symbol: string, limit = 5): Promise<string[]> {
   }
 }
 
+async function getMarketContext(): Promise<string> {
+  const [spy, qqq] = await Promise.all([
+    computeTechnicals("SPY"),
+    computeTechnicals("QQQ"),
+  ]);
+  const fmt = (t: TechData & { symbol: string }) =>
+    `${t.symbol}: $${t.price} (${t.change_pct > 0 ? "+" : ""}${t.change_pct}%) | SMA20: ${t.sma20 ?? "N/A"} | RSI: ${t.rsi14 ?? "N/A"}`;
+  return `${fmt(spy)}\n${fmt(qqq)}`;
+}
+
 async function getMarketData(symbols: string[]) {
   const results = await Promise.all(
     symbols.map(async (sym) => {
@@ -486,7 +496,7 @@ async function discoverSymbols(
   positions: unknown[],
   history: unknown[],
   lastAnalysis: string | null
-): Promise<string[]> {
+): Promise<{ symbols: string[]; earnings: Record<string, string | null> }> {
   const openSymbols = (positions as Record<string, string>[]).map((p) => p.symbol);
 
   const prompt = `Tu es un trader IA. Scanne X (Twitter), Reddit (r/wallstreetbets, r/stocks, r/investing), les news financières et le web en ce moment.
@@ -499,21 +509,29 @@ Ta mission : identifier les actions américaines (NYSE/NASDAQ) les plus promette
 
 Critères : buzz, catalyseurs (earnings, annonce produit, macro), momentum technique, sentiment social.
 
+Pour chaque symbole identifié, cherche aussi sa prochaine date d'earnings (résultats financiers trimestriels).
+
 Réponds UNIQUEMENT en JSON valide, sans markdown :
 {
   "symbols": ["TICKER1", "TICKER2", ...],
-  "rationale": "en 2 phrases : pourquoi ces symboles maintenant"
+  "rationale": "en 2 phrases : pourquoi ces symboles maintenant",
+  "earnings": {
+    "TICKER1": "YYYY-MM-DD",
+    "TICKER2": null
+  }
 }`;
 
   try {
     const content = await callGrok(prompt, undefined, true);
     const parsed = extractJson(content) as Record<string, unknown>;
     const discovered: string[] = (parsed.symbols as string[]) ?? [];
-    // Toujours inclure les positions ouvertes
-    return [...new Set([...discovered, ...openSymbols])];
+    const earnings = (parsed.earnings as Record<string, string | null>) ?? {};
+    const symbols = [...new Set([...discovered, ...openSymbols])];
+    return { symbols, earnings };
   } catch {
     console.error("Discovery parse error — falling back to open positions");
-    return openSymbols.length ? openSymbols : ["SPY"];
+    const symbols = openSymbols.length ? openSymbols : ["SPY"];
+    return { symbols, earnings: {} };
   }
 }
 
@@ -553,20 +571,32 @@ async function makeDecision(
   history: unknown[],
   marketData: Record<string, { tech: TechData & { symbol: string }; news: string[] }>,
   lastAnalysis: string | null,
-  cycleCount: number
+  cycleCount: number,
+  marketContext: string,
+  earnings: Record<string, string | null>
 ) {
+  const now = new Date();
   const marketSummary = Object.entries(marketData)
-    .map(([sym, { tech, news }]) =>
-      `${sym}: $${tech.price} (${tech.change_pct > 0 ? "+" : ""}${tech.change_pct}%) | ` +
-      `Vol: ${tech.volume?.toLocaleString()} | ` +
-      `SMA20: ${tech.sma20 ?? "N/A"} SMA50: ${tech.sma50 ?? "N/A"} | ` +
-      `RSI: ${tech.rsi14 ?? "N/A"} | ` +
-      `MACD: ${tech.macd ?? "N/A"} Sig: ${tech.macd_signal ?? "N/A"} Hist: ${tech.macd_hist ?? "N/A"}\n` +
-      `  News: ${news.length ? news.slice(0, 3).join(" | ") : "aucune"}`
-    )
+    .map(([sym, { tech, news }]) => {
+      const earningsDate = earnings[sym];
+      let earningsStr = "Earnings: inconnue";
+      if (earningsDate) {
+        const daysUntil = Math.round((new Date(earningsDate).getTime() - now.getTime()) / 86400000);
+        const warning = daysUntil >= 0 && daysUntil <= 7 ? " ⚠️ IMMINENT" : daysUntil >= 0 && daysUntil <= 14 ? " (proche)" : "";
+        earningsStr = `Earnings: ${earningsDate} (J${daysUntil >= 0 ? "+" : ""}${daysUntil})${warning}`;
+      }
+      return (
+        `${sym}: $${tech.price} (${tech.change_pct > 0 ? "+" : ""}${tech.change_pct}%) | ` +
+        `Vol: ${tech.volume?.toLocaleString()} | ` +
+        `SMA20: ${tech.sma20 ?? "N/A"} SMA50: ${tech.sma50 ?? "N/A"} | ` +
+        `RSI: ${tech.rsi14 ?? "N/A"} | ` +
+        `MACD: ${tech.macd ?? "N/A"} Sig: ${tech.macd_signal ?? "N/A"} Hist: ${tech.macd_hist ?? "N/A"} | ` +
+        `${earningsStr}\n` +
+        `  News: ${news.length ? news.slice(0, 3).join(" | ") : "aucune"}`
+      );
+    })
     .join("\n\n");
 
-  const now = new Date();
   const DEADLINE = getCurrentWeekDeadline();
   const hoursLeft = Math.max(0, Math.floor((DEADLINE.getTime() - now.getTime()) / (1000 * 60 * 60)));
   const cyclesLeft = estimateRemainingCycles(now, DEADLINE);
@@ -592,6 +622,9 @@ Raisonne étape par étape :
 
   const userPrompt = `## Horodatage
 ${now.toISOString()} — Cycle #${cycleCount} — Il te reste ~${cyclesLeft} cycles (~${hoursLeft}h de marché) avant la deadline.
+
+## État du marché global (contexte — ne pas trader SPY/QQQ directement)
+${marketContext}
 
 ## Portfolio actuel
 - Cash disponible : $${account.cash}
@@ -678,16 +711,20 @@ Deno.serve(async (req) => {
       getLastAnalyses(),
     ]);
 
-    // 5. Grok scanne X, Reddit, les news et choisit les symboles à analyser
-    const symbols = await discoverSymbols(positions, history, lastAnalysis);
+    // 5. Grok scanne X, Reddit, les news et choisit les symboles + earnings dates
+    const { symbols, earnings } = await discoverSymbols(positions, history, lastAnalysis);
     console.log("Symbols discovered by Grok:", symbols);
+    console.log("Earnings dates:", earnings);
 
-    // 6. Données de marché (technicals + news) en parallèle pour tous les symboles
-    const marketData = await getMarketData(symbols);
+    // 6. Données de marché (technicals + news) + contexte global en parallèle
+    const [marketData, marketContext] = await Promise.all([
+      getMarketData(symbols),
+      getMarketContext(),
+    ]);
 
     // 7. Grok prend la décision finale avec les données techniques
     const cycleCount = await getCycleCount();
-    const decisions = await makeDecision(account, positions, history, marketData, lastAnalysis, cycleCount);
+    const decisions = await makeDecision(account, positions, history, marketData, lastAnalysis, cycleCount, marketContext, earnings);
     if (!decisions) {
       await supabase.rpc("release_bot_run");
       return new Response(JSON.stringify({ status: "grok_parse_error" }), { status: 200 });
