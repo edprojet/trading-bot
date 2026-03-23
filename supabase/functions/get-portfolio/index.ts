@@ -35,7 +35,7 @@ Deno.serve(async (req) => {
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
   );
 
-  const [account, positions, clock, snapshotsRes, tradesRes, analysisRes, weeklyRes] = await Promise.all([
+  const [account, positions, clock, snapshotsRes, tradesRes, analysisRes, weeklyRes, memoryRes, reflectionsRes] = await Promise.all([
     fetch(`${ALPACA_BASE_URL}/account`,   { headers: alpacaHeaders }).then(r => r.json()).catch(() => null),
     fetch(`${ALPACA_BASE_URL}/positions`, { headers: alpacaHeaders }).then(r => r.json()).catch(() => null),
     fetch(`${ALPACA_BASE_URL}/clock`,     { headers: alpacaHeaders }).then(r => r.json()).catch(() => null),
@@ -43,6 +43,8 @@ Deno.serve(async (req) => {
     supabase.from("trades").select("*").order("created_at", { ascending: false }).limit(40),
     supabase.from("bot_analyses").select("*").eq("type", "analysis").order("created_at", { ascending: false }).limit(1).maybeSingle(),
     supabase.from("bot_analyses").select("*").eq("type", "weekly_summary").order("created_at", { ascending: false }).limit(1).maybeSingle(),
+    supabase.from("bot_memory").select("content, importance, layer, times_confirmed, times_contradicted, created_at").eq("is_active", true).order("importance", { ascending: false }).limit(20),
+    supabase.from("trade_reflections").select("symbol, pnl, lesson, rule_derived, promote_to_memory, created_at").order("created_at", { ascending: false }).limit(10),
   ]);
 
   return new Response(
@@ -50,10 +52,12 @@ Deno.serve(async (req) => {
       account,
       positions,
       market_open:    clock?.is_open ?? false,
-      snapshots:      snapshotsRes.data ?? [],
-      trades:         tradesRes.data    ?? [],
-      analysis:       analysisRes.data  ?? null,
-      weekly_summary: weeklyRes.data    ?? null,
+      snapshots:      snapshotsRes.data    ?? [],
+      trades:         tradesRes.data       ?? [],
+      analysis:       analysisRes.data     ?? null,
+      weekly_summary: weeklyRes.data       ?? null,
+      memory:         memoryRes.data       ?? [],
+      reflections:    reflectionsRes.data  ?? [],
     }),
     { headers: { ...corsHeaders, "Content-Type": "application/json" } }
   );

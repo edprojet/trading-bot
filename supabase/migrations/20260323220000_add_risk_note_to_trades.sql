@@ -1,0 +1,1 @@
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS risk_note TEXT;

@@ -1,7 +1,5 @@
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
-const SUPABASE_REF = "bhumjspdeveqybkilcxc";
-
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, content-type",
@@ -12,13 +10,8 @@ Deno.serve(async (req) => {
     return new Response("ok", { headers: corsHeaders });
   }
 
-  try {
-    const token = (req.headers.get("Authorization") ?? "").replace("Bearer ", "");
-    const payload = JSON.parse(atob(token.split(".")[1]));
-    if (payload.iss !== "supabase" || payload.ref !== SUPABASE_REF) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: corsHeaders });
-    }
-  } catch {
+  const token = (req.headers.get("Authorization") ?? "").replace("Bearer ", "");
+  if (!token || token !== Deno.env.get("SUPABASE_ANON_KEY")) {
     return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: corsHeaders });
   }
 

@@ -3,6 +3,7 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 const ALPACA_BASE_URL = "https://paper-api.alpaca.markets/v2";
 const ALPACA_DATA_URL = "https://data.alpaca.markets/v2";
 const GROK_BASE_URL = "https://api.x.ai/v1";
+const STOP_LOSS_PCT = 0.08; // Stop-loss hard à -8% — SELL forcé sans consulter Grok
 
 
 // ---------------------------------------------------------------------------
@@ -96,7 +97,7 @@ async function fetchBars(symbol: string, limit = 200): Promise<Bar[]> {
   try {
     const start = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
     const res = await fetch(
-      `${ALPACA_DATA_URL}/stocks/${symbol}/bars?timeframe=15Min&limit=${limit}&start=${start}&feed=sip`,
+      `${ALPACA_DATA_URL}/stocks/${symbol}/bars?timeframe=15Min&limit=${limit}&start=${start}&feed=iex`,
       { headers: alpacaHeaders }
     );
     const data = await res.json();
@@ -249,16 +250,31 @@ async function logSnapshot(cash: number, equity: number, positions: unknown[]) {
   await supabase.from("portfolio_snapshots").insert({ cash, equity, positions });
 }
 
-async function getLastAnalyses(): Promise<string | null> {
-  const { data } = await supabase
-    .from("bot_analyses")
-    .select("analysis, created_at, trade_count, type")
-    .order("created_at", { ascending: false })
-    .limit(2);
-  if (!data?.length) return null;
-  return data.map(a =>
-    `### Analyse du cycle #${a.trade_count} (${new Date(a.created_at).toISOString().split("T")[0]})\n${a.analysis}`
-  ).join("\n\n---\n\n");
+async function getLastAnalyses(): Promise<{ cyclic: string | null; weekly: string | null }> {
+  const [{ data: cyclicData }, { data: weeklyData }] = await Promise.all([
+    supabase
+      .from("bot_analyses")
+      .select("analysis, created_at, trade_count")
+      .eq("type", "analysis")
+      .order("created_at", { ascending: false })
+      .limit(1),
+    supabase
+      .from("bot_analyses")
+      .select("analysis, created_at, trade_count")
+      .eq("type", "weekly_summary")
+      .order("created_at", { ascending: false })
+      .limit(1),
+  ]);
+
+  const cyclic = cyclicData?.[0]
+    ? `### Analyse de performance (cycle #${cyclicData[0].trade_count}, ${new Date(cyclicData[0].created_at).toISOString().split("T")[0]})\n${cyclicData[0].analysis}`
+    : null;
+
+  const weekly = weeklyData?.[0]
+    ? `### Bilan hebdomadaire (cycle #${weeklyData[0].trade_count}, ${new Date(weeklyData[0].created_at).toISOString().split("T")[0]})\n${weeklyData[0].analysis}`
+    : null;
+
+  return { cyclic, weekly };
 }
 
 async function getCycleCount(): Promise<number> {
@@ -268,6 +284,192 @@ async function getCycleCount(): Promise<number> {
   return count ?? 0;
 }
 
+// ---------------------------------------------------------------------------
+// Mémoire persistante (Phase 2)
+// ---------------------------------------------------------------------------
+
+async function loadBotMemory(): Promise<string> {
+  const { data } = await supabase
+    .from("bot_memory")
+    .select("layer, content, importance, times_confirmed, times_contradicted")
+    .eq("is_active", true)
+    .order("importance", { ascending: false })
+    .limit(20);
+
+  if (!data?.length) return "";
+
+  const lines = data.map((r, i) =>
+    `Règle #${i + 1} [importance ${r.importance}/100, layer: ${r.layer}] : ${r.content}` +
+    (r.times_confirmed || r.times_contradicted
+      ? ` (confirmée ${r.times_confirmed}x, contredite ${r.times_contradicted}x)`
+      : "")
+  );
+  return lines.join("\n");
+}
+
+async function reflectOnClosedTrade(
+  symbol: string,
+  pnl: number,
+  entryReason: string,
+  exitReason: string
+): Promise<void> {
+  const prompt = `Tu es un trader IA qui analyse ses propres trades pour apprendre.
+
+## Trade clôturé
+- Symbole : ${symbol}
+- PnL réalisé : ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}
+- Raison d'entrée (BUY) : ${entryReason}
+- Raison de sortie (SELL) : ${exitReason}
+
+Analyse ce trade et extrais un apprentissage concret.
+
+Réponds UNIQUEMENT en JSON valide, sans markdown :
+{
+  "lesson": "ce que tu as appris de ce trade en 1-2 phrases",
+  "rule_derived": "la règle concrète que tu en tires (ou null si rien de nouveau)",
+  "importance": 50,
+  "promote_to_memory": true
+}
+
+- "importance" : 0-100 (calibre selon la force de la leçon)
+- "promote_to_memory" : true si la règle mérite d'être mémorisée durablement, false sinon`;
+
+  try {
+    const content = await callGrok(prompt, undefined, false);
+    const parsed = extractJson(content) as Record<string, unknown>;
+
+    const lesson = String(parsed.lesson ?? "");
+    const ruleDerived = parsed.rule_derived ? String(parsed.rule_derived) : null;
+    const importance = typeof parsed.importance === "number" ? parsed.importance : 50;
+    const promoteToMemory = Boolean(parsed.promote_to_memory);
+
+    // Insérer la réflexion
+    const { data: reflection } = await supabase.from("trade_reflections").insert({
+      symbol,
+      pnl,
+      entry_reason: entryReason,
+      exit_reason: exitReason,
+      lesson,
+      rule_derived: ruleDerived,
+      promote_to_memory: promoteToMemory,
+    }).select("id").single();
+
+    // Promouvoir en mémoire si demandé
+    if (promoteToMemory && ruleDerived) {
+      const { data: memory } = await supabase.from("bot_memory").insert({
+        layer: "rule",
+        content: ruleDerived,
+        context: { symbol },
+        importance,
+        source: "bot",
+      }).select("id").single();
+
+      if (memory?.id && reflection?.id) {
+        await supabase.from("trade_reflections").update({ memory_id: memory.id }).eq("id", reflection.id);
+      }
+
+      console.log(`Nouvelle règle mémorisée depuis ${symbol}: "${ruleDerived}"`);
+    }
+
+    console.log(`Réflexion post-trade ${symbol} (${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}): "${lesson}"`);
+  } catch (err) {
+    console.error("reflectOnClosedTrade() error:", err);
+  }
+}
+
+async function consolidateMemory(cycleCount: number): Promise<void> {
+  // Charger les 20 dernières réflexions
+  const { data: reflections } = await supabase
+    .from("trade_reflections")
+    .select("symbol, pnl, lesson, rule_derived, promote_to_memory")
+    .order("created_at", { ascending: false })
+    .limit(20);
+
+  // Charger les règles actives
+  const { data: rules } = await supabase
+    .from("bot_memory")
+    .select("id, content, importance, times_confirmed, times_contradicted, layer")
+    .eq("is_active", true)
+    .order("importance", { ascending: false });
+
+  if (!reflections?.length && !rules?.length) return;
+
+  const prompt = `Tu es un trader IA. Consolide ta mémoire à partir de tes récentes réflexions post-trade et de tes règles actuelles.
+
+## Tes 20 dernières réflexions post-trade
+${JSON.stringify(reflections, null, 2)}
+
+## Tes règles actuelles en mémoire
+${JSON.stringify(rules, null, 2)}
+
+Analyse et retourne une liste d'actions pour mettre à jour ta mémoire.
+
+Réponds UNIQUEMENT en JSON valide, sans markdown :
+{
+  "actions": [
+    {
+      "type": "confirm",
+      "id": "<uuid de la règle existante>",
+      "reason": "pourquoi cette règle est confirmée"
+    },
+    {
+      "type": "update",
+      "id": "<uuid de la règle existante>",
+      "new_content": "nouvelle formulation améliorée",
+      "new_importance": 75
+    },
+    {
+      "type": "archive",
+      "id": "<uuid de la règle existante>",
+      "reason": "pourquoi archiver (obsolète, contredite...)"
+    },
+    {
+      "type": "create",
+      "content": "nouvelle règle à mémoriser",
+      "layer": "rule",
+      "importance": 70,
+      "reason": "pourquoi créer cette règle"
+    }
+  ]
+}
+
+Sois sélectif : ne créer que des règles vraiment utiles. Ne pas confirmer une règle juste pour confirmer.`;
+
+  try {
+    const content = await callGrok(prompt, undefined, false);
+    const parsed = extractJson(content) as Record<string, unknown>;
+    const actions = (parsed.actions ?? []) as Array<Record<string, unknown>>;
+
+    for (const action of actions) {
+      if (action.type === "confirm" && action.id) {
+        const { data: row } = await supabase.from("bot_memory").select("times_confirmed").eq("id", action.id).single();
+        if (row) await supabase.from("bot_memory").update({ times_confirmed: (row.times_confirmed ?? 0) + 1, updated_at: new Date().toISOString() }).eq("id", action.id);
+
+      } else if (action.type === "update" && action.id) {
+        await supabase.from("bot_memory").update({
+          content: action.new_content,
+          importance: action.new_importance,
+          updated_at: new Date().toISOString(),
+        }).eq("id", action.id);
+
+      } else if (action.type === "archive" && action.id) {
+        await supabase.from("bot_memory").update({ is_active: false, updated_at: new Date().toISOString() }).eq("id", action.id);
+
+      } else if (action.type === "create") {
+        await supabase.from("bot_memory").insert({
+          layer: action.layer ?? "rule",
+          content: action.content,
+          importance: action.importance ?? 50,
+          source: "bot",
+        });
+      }
+    }
+
+    console.log(`consolidateMemory() cycle #${cycleCount} — ${actions.length} actions appliquées`);
+  } catch (err) {
+    console.error("consolidateMemory() error:", err);
+  }
+}
 
 async function generateAndSaveAnalysis(
   cycleCount: number,
@@ -296,9 +498,9 @@ async function generateAndSaveAnalysis(
       ).join("\n")
     : "  Aucune";
 
-  const previousAnalyses = await getLastAnalyses();
+  const { cyclic: previousCyclic } = await getLastAnalyses();
 
-  const prompt = `Tu es un trader IA qui analyse ses propres décisions pour s'améliorer.
+  const prompt = `Tu es un trader IA qui améliore son analyse de performance en continu.
 
 ## État du portfolio (maintenant)
 - Equity totale : $${account.equity} | Cash disponible : $${account.cash}
@@ -312,13 +514,22 @@ ${positionsStr}
 
 ## 20 dernières décisions (récent → ancien)
 ${JSON.stringify(lastDecisions, null, 2)}
-${previousAnalyses ? `\n## Analyses précédentes\n${previousAnalyses}\n` : ""}
-Produis une auto-analyse structurée et actionnable :
+${previousCyclic ? `\n## Ta version précédente de cette analyse\n${previousCyclic}\n` : ""}
+${previousCyclic
+  ? `Produis une version améliorée de ton analyse — garde ce qui reste vrai, corrige ce qui était faux, ajoute ce que tu as appris depuis. Cette version remplace la précédente dans les prompts futurs.
+
 1. **Performance réelle** : le portfolio progresse-t-il ? Analyse le PnL et l'equity.
 2. **Décisions pertinentes** : quelles décisions étaient justifiées et pourquoi
 3. **Décisions discutables** : quelles décisions auraient pu être différentes
 4. **Patterns identifiés** : tendances récurrentes (ex: trop de HOLD, entrées trop tôt, mauvais timing...)
-${previousAnalyses ? "5. **Feedback analyses précédentes** : les ajustements recommandés ont-ils été appliqués ? Avec quel résultat ?\n6. **Ajustements concrets** : ce que tu vas changer dans les prochains cycles" : "5. **Ajustements concrets** : ce que tu vas changer dans les prochains cycles"}
+5. **Feedback version précédente** : les ajustements recommandés ont-ils été appliqués ? Avec quel résultat ?
+6. **Ajustements concrets** : ce que tu vas changer dans les prochains cycles`
+  : `Produis une première analyse structurée et actionnable :
+1. **Performance réelle** : le portfolio progresse-t-il ? Analyse le PnL et l'equity.
+2. **Décisions pertinentes** : quelles décisions étaient justifiées et pourquoi
+3. **Décisions discutables** : quelles décisions auraient pu être différentes
+4. **Patterns identifiés** : tendances récurrentes (ex: trop de HOLD, entrées trop tôt, mauvais timing...)
+5. **Ajustements concrets** : ce que tu vas changer dans les prochains cycles`}
 
 Sois concis, factuel et actionnable. Cette analyse sera injectée dans tes prochains prompts de décision.`;
 
@@ -367,7 +578,9 @@ async function generateWeeklySummary(
       ).join("\n")
     : "  Aucune";
 
-  const prompt = `Tu es un trader IA. La semaine de trading se termine. Produis un bilan complet.
+  const { weekly: previousWeekly } = await getLastAnalyses();
+
+  const prompt = `Tu es un trader IA. La semaine de trading se termine. ${previousWeekly ? "Améliore ton bilan stratégique en intégrant les résultats de cette semaine." : "Produis un premier bilan complet."}
 
 ## Performance de la semaine
 - Equity finale : $${account.equity} | Départ : ~$100 000
@@ -379,15 +592,19 @@ ${positionsStr}
 
 ## Toutes les décisions de la semaine
 ${JSON.stringify(weekDecisions, null, 2)}
+${previousWeekly ? `\n## Ton bilan précédent\n${previousWeekly}\n` : ""}
+${previousWeekly
+  ? `Produis une version améliorée de ce bilan — garde la stratégie qui reste valide, corrige ce qui était faux, intègre ce que cette semaine t'a appris en plus. Cette version remplace la précédente.`
+  : `Produis un bilan hebdomadaire structuré :`}
 
-Produis un bilan hebdomadaire structuré :
 1. **Résumé de la semaine** : performance globale, est-ce une bonne semaine ?
 2. **Meilleures décisions** : quels trades ont le plus contribué au résultat
 3. **Pires décisions** : quels trades ont coûté le plus cher
 4. **Stratégie semaine prochaine** : que faire différemment lundi ? Sur quels secteurs se concentrer ?
 5. **3 règles concrètes** pour améliorer les performances la semaine prochaine
+${previousWeekly ? "6. **Feedback bilan précédent** : les recommandations de la semaine dernière ont-elles été suivies ? Avec quel résultat ?" : ""}
 
-Ce bilan sera injecté dans le premier cycle de la semaine prochaine. Sois factuel et stratégique.`;
+Ce bilan sera injecté dans chaque cycle de la semaine prochaine. Sois factuel et stratégique.`;
 
   const analysis = await callGrok(prompt);
 
@@ -570,10 +787,12 @@ async function makeDecision(
   positions: unknown[],
   history: unknown[],
   marketData: Record<string, { tech: TechData & { symbol: string }; news: string[] }>,
-  lastAnalysis: string | null,
+  cyclicAnalysis: string | null,
+  weeklyAnalysis: string | null,
   cycleCount: number,
   marketContext: string,
-  earnings: Record<string, string | null>
+  earnings: Record<string, string | null>,
+  botMemory: string
 ) {
   const now = new Date();
   const marketSummary = Object.entries(marketData)
@@ -597,31 +816,40 @@ async function makeDecision(
     })
     .join("\n\n");
 
-  const DEADLINE = getCurrentWeekDeadline();
-  const hoursLeft = Math.max(0, Math.floor((DEADLINE.getTime() - now.getTime()) / (1000 * 60 * 60)));
-  const cyclesLeft = estimateRemainingCycles(now, DEADLINE);
-
   const systemPrompt = `Tu es le moteur de décision d'un bot de trading autonome opérant sur les marchés américains (NYSE / NASDAQ).
 
 ## Comment tu fonctionnes
 Toutes les 30 minutes pendant les heures de marché (09h30–16h00 ET, lundi–vendredi), tu reçois l'état complet du portfolio, les données de marché en temps réel, et l'historique de tes trades. Tu n'as pas de mémoire entre les appels — tout le contexte est fourni à chaque fois.
 
 ## Ton objectif
-Faire croître un portfolio de $100 000 au maximum sur la semaine en cours (lundi → vendredi 16h00 ET). Chaque semaine repart de zéro avec un nouvel objectif.
+Faire croître le portfolio de façon **consistante et durable**. Vise +0.3% à +0.5% par jour. Une semaine régulière à +1.5% vaut mieux qu'une semaine à +5% suivie d'un drawdown. Ne jamais perdre plus de 2% en un seul jour. La consistance sur la durée est ce qui compte.
 
 ## Règles non négociables
 1. Maximum 25% du portfolio total par position (ex: si equity = $100k, max $25k par symbole)
 2. Ne jamais perdre plus de 15% du portfolio initial dans la semaine (seuil : $85 000)
 3. Tu peux placer plusieurs ordres simultanément dans le même cycle
 
+## Règles d'allocation — OBLIGATOIRES
+- **Minimum 60% du portfolio doit être investi en permanence** pendant les heures de marché.
+- **Si tu as moins de 3 positions ouvertes ET plus de $30 000 en cash → tu DOIS placer au moins un BUY ce cycle.**
+- **Position sizing** : utilise "montant_à_investir = cash_disponible / 4" pour calculer la taille de chaque nouvelle position.
+- **HOLD = cas exceptionnel uniquement** (timing vraiment flou, signal contradictoire majeur). Ce n'est PAS une option par défaut.
+
+## Comment décider — exemples concrets
+**Exemple agressif (correct)** : Tu as $80k en cash, 1 position ouverte. Signal fort sur NVDA (RSI 45, MACD haussier, annonce produit ce soir). → BUY NVDA avec $20k ($80k/4). Tu as du cash, tu as un signal, tu achètes.
+**Exemple conservateur (incorrect)** : Mêmes conditions. → HOLD "par prudence". NON. Rester assis sur $80k de cash alors qu'il y a des signaux, c'est rater l'objectif.
+**HOLD légitime** : Tu as 4 positions ouvertes représentant 70%+ du portfolio, aucun nouveau signal clair, marché dans une range étroite. → HOLD pour ce cycle.
+
 ## Comment décider
 Raisonne étape par étape :
 1. **Évalue chaque position ouverte** : PnL non réalisé, momentum, risque — vaut-il mieux tenir ou couper ?
 2. **Scanne le marché** : quelles opportunités existent RIGHT NOW (buzz, catalyseurs, technicals) ?
-3. **Décide au niveau du portfolio** : quelle combinaison d'actions maximise le gain tout en respectant les règles ?`;
+3. **Vérifie ton allocation** : si < 60% investi et des signaux existent → BUY obligatoire.
+4. **Décide au niveau du portfolio** : quelle combinaison d'actions maximise le gain tout en respectant les règles ?`;
 
   const userPrompt = `## Horodatage
-${now.toISOString()} — Cycle #${cycleCount} — Il te reste ~${cyclesLeft} cycles (~${hoursLeft}h de marché) avant la deadline.
+${now.toISOString()} — Cycle #${cycleCount}
+${botMemory ? `\n## Tes règles (écrites par toi-même — OBLIGATOIRES)\n${botMemory}\n` : ""}
 
 ## État du marché global (contexte — ne pas trader SPY/QQQ directement)
 ${marketContext}
@@ -639,7 +867,7 @@ ${marketSummary}
 
 ## Historique de tes ${history.length} derniers trades BUY/SELL (récent → ancien)
 ${JSON.stringify(history, null, 2)}
-${lastAnalysis ? `\n## Tes dernières auto-analyses de performance\n${lastAnalysis}\n` : ""}
+${cyclicAnalysis ? `\n## Ton analyse de performance (version actuelle)\n${cyclicAnalysis}\n` : ""}${weeklyAnalysis ? `\n## Ton bilan hebdomadaire (version actuelle)\n${weeklyAnalysis}\n` : ""}
 ## Instructions
 1. Scanne X, Reddit et les news financières en ce moment
 2. Applique le raisonnement en 3 étapes (positions → marché → portfolio)
@@ -664,6 +892,87 @@ Si tu n'as aucun trade à faire, retourne un tableau avec un seul HOLD : [{"acti
   } catch {
     console.error("Decision parse error — raw Grok response:", content);
     return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Risk Agent (Phase 3) — valide/ajuste les décisions de makeDecision
+// ---------------------------------------------------------------------------
+
+async function applyRiskCheck(
+  decisions: Array<Record<string, unknown>>,
+  account: Record<string, unknown>,
+  positions: unknown[],
+  botMemory: string
+): Promise<Array<Record<string, unknown>>> {
+  // Si aucune décision actionnable, pas besoin du Risk Agent
+  const actionable = decisions.filter(d => d.action === "BUY" || d.action === "SELL");
+  if (!actionable.length) return decisions;
+
+  const positionsStr = (positions as Record<string, unknown>[]).length
+    ? (positions as Record<string, unknown>[]).map(p =>
+        `  ${p.symbol}: ${p.qty} actions | PnL non réalisé : $${p.unrealized_pl} (${(parseFloat(String(p.unrealized_plpc ?? 0)) * 100).toFixed(2)}%)`
+      ).join("\n")
+    : "  Aucune";
+
+  const maxPerPosition = (parseFloat(String(account.equity)) * 0.25).toFixed(0);
+  const maxTotalInvested = (parseFloat(String(account.equity)) * 0.85).toFixed(0);
+
+  const prompt = `Tu es le Risk Manager d'un bot de trading. Le Trader IA vient de proposer des décisions. Ton rôle : valider, ajuster ou bloquer en fonction des règles de risque.
+
+## Portfolio actuel
+- Cash disponible : $${account.cash}
+- Equity totale : $${account.equity}
+- Positions ouvertes :
+${positionsStr}
+
+## Décisions proposées par le Trader
+${JSON.stringify(decisions, null, 2)}
+${botMemory ? `\n## Règles mémorisées du bot (à respecter)\n${botMemory}\n` : ""}
+## Règles de risque non négociables
+1. Maximum 25% du portfolio par position (max $${maxPerPosition} par symbole)
+2. Maximum 4 positions ouvertes simultanément
+3. Ne jamais dépasser 85% du capital total investi (max $${maxTotalInvested} investi)
+4. Si une règle mémorisée s'applique clairement à une décision → applique-la
+
+## Tes options pour chaque décision
+- **APPROVE** : décision validée telle quelle → recopie-la sans modification
+- **REDUCE** : réduire la quantité (précise la nouvelle quantité dans "quantity" et explique dans "risk_note")
+- **BLOCK** : convertir en HOLD (seulement si violation claire d'une règle — pas par prudence générale)
+
+## Instructions
+- Ne bloque PAS par excès de prudence générale
+- Ne réduis une quantité que si elle dépasse vraiment une limite calculable
+- Si tout est dans les clous → approuve tout, retourne les décisions identiques
+- Raisonne au niveau du portfolio global
+
+Réponds UNIQUEMENT en JSON valide (tableau), sans markdown :
+[
+  {
+    "action": "BUY" | "SELL" | "HOLD",
+    "symbol": "TICKER ou null",
+    "quantity": nombre entier ou null,
+    "reason": "raison originale du trader",
+    "risk_note": null | "ce qui a été ajusté et pourquoi (seulement si modification)"
+  }
+]
+Retourne TOUTES les décisions originales (y compris les HOLD non modifiées).`;
+
+  try {
+    const content = await callGrok(prompt, undefined, false);
+    const parsed = extractJson(content);
+    const validated = (Array.isArray(parsed) ? parsed : [parsed]) as Array<Record<string, unknown>>;
+
+    for (const d of validated) {
+      if (d.risk_note) {
+        console.log(`Risk Agent — ${d.action} ${d.symbol}: ${d.risk_note}`);
+      }
+    }
+
+    return validated;
+  } catch (err) {
+    console.error("applyRiskCheck() error — fallback sur décisions originales:", err);
+    return decisions;
   }
 }
 
@@ -705,14 +1014,15 @@ Deno.serve(async (req) => {
     // 3. Snapshot
     await logSnapshot(parseFloat(account.cash), parseFloat(account.equity), positions);
 
-    // 4. Historique des trades + dernières analyses (en parallèle)
-    const [history, lastAnalysis] = await Promise.all([
+    // 4. Mémoire du bot + historique des trades + dernières analyses (en parallèle)
+    const [botMemory, history, analyses] = await Promise.all([
+      loadBotMemory(),
       getTradeHistory(50),
       getLastAnalyses(),
     ]);
-
     // 5. Grok scanne X, Reddit, les news et choisit les symboles + earnings dates
-    const { symbols, earnings } = await discoverSymbols(positions, history, lastAnalysis);
+    const lastAnalysisForDiscovery = [analyses.cyclic, analyses.weekly].filter(Boolean).join("\n\n---\n\n") || null;
+    const { symbols, earnings } = await discoverSymbols(positions, history, lastAnalysisForDiscovery);
     console.log("Symbols discovered by Grok:", symbols);
     console.log("Earnings dates:", earnings);
 
@@ -722,17 +1032,51 @@ Deno.serve(async (req) => {
       getMarketContext(),
     ]);
 
-    // 7. Grok prend la décision finale avec les données techniques
+    // 7. Stop-loss hard — SELL forcé si position à -8% ou pire (sans consulter Grok)
+    const stopLossOrders: Array<{ symbol: string; qty: number }> = [];
+    for (const pos of positions as Record<string, unknown>[]) {
+      const plpc = parseFloat(String(pos.unrealized_plpc ?? 0));
+      if (plpc <= -STOP_LOSS_PCT) {
+        console.warn(`STOP-LOSS déclenché sur ${pos.symbol} (${(plpc * 100).toFixed(2)}%)`);
+        const qty = parseInt(String(pos.qty), 10);
+        const alpacaOrder = await placeOrder(pos.symbol as string, qty, "sell");
+        if (alpacaOrder?.code || alpacaOrder?.message) {
+          console.error("Alpaca STOP-LOSS rejected:", alpacaOrder);
+          await logTrade({ symbol: pos.symbol, action: "SELL_REJECTED", quantity: qty, reason: `STOP-LOSS automatique (-${(plpc * 100).toFixed(2)}%) — rejeté par Alpaca: ${JSON.stringify(alpacaOrder)}`, status: "error" });
+        } else {
+          const priceExit = await getLatestPrice(pos.symbol as string) || parseFloat(String(pos.current_price ?? 0));
+          if (priceExit) await closeBuyTrade(pos.symbol as string, priceExit);
+          const stopLossReason = `STOP-LOSS automatique déclenché à ${(plpc * 100).toFixed(2)}% de perte`;
+          await logTrade({ symbol: pos.symbol, action: "SELL", quantity: qty, reason: stopLossReason, price_entry: priceExit, alpaca_order_id: alpacaOrder?.id ?? null, status: "closed" });
+          stopLossOrders.push({ symbol: pos.symbol as string, qty });
+          // Réflexion post-trade sur le stop-loss
+          const stopLossPnl = parseFloat(String(pos.unrealized_pl ?? 0));
+          const entryReasonForStop = history.find((t: Record<string, unknown>) => t.symbol === pos.symbol && t.action === "BUY")?.reason as string ?? "raison inconnue";
+          await reflectOnClosedTrade(pos.symbol as string, stopLossPnl, entryReasonForStop, stopLossReason);
+        }
+      }
+    }
+    // Retirer les positions liquidées par stop-loss pour ne pas les re-traiter
+    const positionsAfterStopLoss = (positions as Record<string, unknown>[]).filter(
+      p => !stopLossOrders.some(sl => sl.symbol === p.symbol)
+    );
+
+    // 8. Grok prend la décision finale avec les données techniques
     const cycleCount = await getCycleCount();
-    const decisions = await makeDecision(account, positions, history, marketData, lastAnalysis, cycleCount, marketContext, earnings);
-    if (!decisions) {
+    const rawDecisions = await makeDecision(account, positionsAfterStopLoss, history, marketData, analyses.cyclic, analyses.weekly, cycleCount, marketContext, earnings, botMemory);
+    if (!rawDecisions) {
       await supabase.rpc("release_bot_run");
       return new Response(JSON.stringify({ status: "grok_parse_error" }), { status: 200 });
     }
 
-    console.log("Grok decisions:", decisions);
+    console.log("Grok decisions (avant Risk Agent):", rawDecisions);
 
-    // 8. Exécuter chaque décision et tout logger (y compris HOLD)
+    // 8b. Risk Agent — valide/ajuste les décisions
+    const decisions = await applyRiskCheck(rawDecisions, account, positionsAfterStopLoss, botMemory);
+
+    console.log("Decisions après Risk Agent:", decisions);
+
+    // 9. Exécuter chaque décision et tout logger (y compris HOLD)
     const executedOrders = [];
     for (const decision of decisions) {
       let alpacaOrder = null;
@@ -762,6 +1106,11 @@ Deno.serve(async (req) => {
         }
         if (priceExit) await closeBuyTrade(decision.symbol, priceExit);
         priceEntry = priceExit;
+        // Réflexion post-trade
+        const sellPos = (positions as Record<string, unknown>[]).find(p => p.symbol === decision.symbol);
+        const sellPnl = parseFloat(String(sellPos?.unrealized_pl ?? 0));
+        const sellEntryReason = history.find((t: Record<string, unknown>) => t.symbol === decision.symbol && t.action === "BUY")?.reason as string ?? "raison inconnue";
+        await reflectOnClosedTrade(decision.symbol, sellPnl, sellEntryReason, decision.reason);
       } else if (decision.action !== "HOLD") {
         console.warn("Decision invalide ignorée:", JSON.stringify(decision));
         continue;
@@ -776,24 +1125,30 @@ Deno.serve(async (req) => {
         price_entry: priceEntry,
         alpaca_order_id: alpacaOrder?.id ?? null,
         status: decision.action === "SELL" ? "closed" : decision.action === "BUY" ? "open" : "hold",
+        risk_note: (decision.risk_note as string) ?? null,
       });
 
       if (alpacaOrder) executedOrders.push(alpacaOrder);
     }
 
-    // 9. Auto-analyse tous les 5 cycles
+    // 10. Consolidation mémoire tous les 10 cycles
+    if (cycleCount > 0 && cycleCount % 10 === 0) {
+      await consolidateMemory(cycleCount);
+    }
+
+    // 11. Auto-analyse tous les 5 cycles
     if (cycleCount > 0 && cycleCount % 5 === 0) {
       await generateAndSaveAnalysis(cycleCount, account, positions);
     }
 
-    // 10. Bilan de fin de semaine (dernier cycle du vendredi)
+    // 12. Bilan de fin de semaine (dernier cycle du vendredi)
     const weekDeadline = getCurrentWeekDeadline();
     if (isLastCycleOfWeek(new Date(), weekDeadline)) {
       await generateWeeklySummary(account, positions, cycleCount);
     }
 
     await supabase.rpc("release_bot_run");
-    return new Response(JSON.stringify({ status: "ok", decisions, executedOrders }), { status: 200 });
+    return new Response(JSON.stringify({ status: "ok", rawDecisions, decisions, executedOrders }), { status: 200 });
   } catch (err) {
     console.error(err);
     await supabase.rpc("release_bot_run");

@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trading Bot — Brain</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg:        #080808;
+      --surface:   #101010;
+      --border:    #1e1e1e;
+      --green:     #00ff88;
+      --green-dim: rgba(0,255,136,.08);
+      --red:       #ff3d5a;
+      --red-dim:   rgba(255,61,90,.08);
+      --muted:     #444;
+      --label:     #666;
+      --text:      #d0d0d0;
+      --white:     #f0f0f0;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { font-size: 14px; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Syne', sans-serif;
+      min-height: 100vh;
+      padding: 0 0 60px;
+    }
+
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background: repeating-linear-gradient(to bottom, transparent 0px, transparent 2px, rgba(0,0,0,.04) 2px, rgba(0,0,0,.04) 4px);
+      pointer-events: none;
+      z-index: 9999;
+    }
+
+    /* ── HEADER ── */
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(8,8,8,.92);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 32px;
+      height: 56px;
+    }
+
+    .header-left { display: flex; align-items: center; gap: 24px; }
+    .header-right { display: flex; align-items: center; gap: 12px; }
+
+    .logo {
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 600;
+      font-size: 13px;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+      color: var(--white);
+    }
+    .logo span { color: var(--green); }
+
+    .nav-link {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--muted);
+      text-decoration: none;
+      letter-spacing: .05em;
+      transition: color .2s;
+    }
+    .nav-link:hover { color: var(--text); }
+
+    .logo-nav { position: relative; }
+
+    .logo-tab-active {
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 600;
+      font-size: 13px;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+      color: var(--white);
+      cursor: pointer;
+      user-select: none;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .logo-tab-active span.prefix { color: var(--green); }
+    .logo-tab-active .chevron {
+      font-size: 9px;
+      color: var(--muted);
+      transition: transform .2s;
+    }
+    .logo-nav.open .chevron { transform: rotate(180deg); }
+
+    .nav-dropdown {
+      display: none;
+      position: absolute;
+      top: calc(100% + 10px);
+      left: 0;
+      background: #111;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+      min-width: 160px;
+      z-index: 200;
+    }
+    .logo-nav.open .nav-dropdown { display: block; }
+
+    .nav-dropdown a {
+      display: block;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+      color: var(--muted);
+      text-decoration: none;
+      padding: 10px 16px;
+      transition: color .15s, background .15s;
+    }
+    .nav-dropdown a span { color: var(--green); }
+    .nav-dropdown a:hover { color: var(--white); background: rgba(255,255,255,.03); }
+
+    .last-refresh {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--label);
+    }
+
+    .refresh-btn {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      background: none;
+      border: 1px solid var(--border);
+      padding: 5px 12px;
+      border-radius: 3px;
+      cursor: pointer;
+      transition: all .2s;
+    }
+    .refresh-btn:hover { color: var(--green); border-color: rgba(0,255,136,.3); }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .refresh-btn.spinning { animation: spin .6s linear infinite; }
+
+    /* ── MAIN ── */
+    main { max-width: 1400px; margin: 0 auto; padding: 32px 32px 0; }
+
+    .section-label {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      letter-spacing: .2em;
+      text-transform: uppercase;
+      color: var(--label);
+      margin-bottom: 12px;
+    }
+
+    /* ── TWO-COL GRID ── */
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 24px;
+      align-items: start;
+    }
+
+    @media (max-width: 900px) {
+      .two-col { grid-template-columns: 1fr; }
+    }
+
+    /* ── CARD ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 22px;
+    }
+
+    /* ── ANALYSIS ── */
+    .analysis-content {
+      font-size: 13px;
+      line-height: 1.7;
+      color: var(--text);
+      max-height: 360px;
+      overflow-y: auto;
+      padding-right: 6px;
+      mask-image: linear-gradient(to bottom, black 80%, transparent 100%);
+      -webkit-mask-image: linear-gradient(to bottom, black 80%, transparent 100%);
+    }
+    .analysis-content:hover {
+      mask-image: none;
+      -webkit-mask-image: none;
+    }
+    .analysis-content strong, .analysis-content b { color: var(--white); font-weight: 600; }
+
+    .analysis-date {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      color: var(--label);
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+
+    .analysis-empty {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      color: var(--muted);
+      font-style: italic;
+    }
+
+    /* ── MEMORY ── */
+    .memory-count {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      color: var(--label);
+      margin-bottom: 14px;
+    }
+
+    .memory-list {
+      max-height: 360px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+
+    .memory-rule {
+      margin-bottom: 12px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .memory-rule:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+
+    .memory-rule-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 5px;
+    }
+
+    .importance-bar { height: 2px; max-width: 50px; border-radius: 1px; flex-shrink: 0; }
+
+    .importance-label {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      color: var(--label);
+    }
+
+    .memory-stats {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      margin-left: auto;
+    }
+
+    .memory-rule-content { font-size: 12px; color: var(--text); line-height: 1.5; }
+
+    /* ── TABLE ── */
+    .table-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+
+    .table-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 22px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .table-title {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      letter-spacing: .2em;
+      text-transform: uppercase;
+      color: var(--label);
+    }
+
+    .table-count {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      color: var(--muted);
+    }
+
+    .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+    table { width: 100%; border-collapse: collapse; }
+
+    thead th {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+      color: var(--label);
+      padding: 9px 16px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      font-weight: 400;
+    }
+
+    tbody tr { border-bottom: 1px solid rgba(30,30,30,.6); transition: background .15s; }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: rgba(255,255,255,.02); }
+
+    tbody td { padding: 10px 16px; font-size: 12px; vertical-align: middle; }
+
+    .td-time {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .badge-symbol {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--white);
+      background: rgba(255,255,255,.05);
+      border: 1px solid rgba(255,255,255,.08);
+      padding: 2px 8px;
+      border-radius: 3px;
+    }
+
+    .td-pnl { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 500; white-space: nowrap; }
+    .td-pnl.pos { color: var(--green); }
+    .td-pnl.neg { color: var(--red); }
+
+    .td-lesson { font-size: 12px; color: var(--muted); max-width: 420px; }
+    .td-lesson.expandable { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+    .td-lesson.expandable:hover { color: var(--text); }
+    .td-lesson.expandable.expanded { white-space: normal; overflow: visible; }
+
+    .memory-badge {
+      display: inline-block;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 9px;
+      padding: 2px 7px;
+      border-radius: 2px;
+      color: var(--green);
+      background: var(--green-dim);
+      border: 1px solid rgba(0,255,136,.2);
+      white-space: nowrap;
+    }
+
+    /* ── SKELETON ── */
+    .skeleton {
+      background: linear-gradient(90deg, var(--border) 25%, #1a1a1a 50%, var(--border) 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.5s infinite;
+      border-radius: 3px;
+    }
+    @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+    .skel-row { height: 40px; width: 100%; margin-bottom: 8px; }
+
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    @media (max-width: 768px) {
+      main { padding: 16px; }
+      header { padding: 0 16px; }
+      .last-refresh { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo-nav" id="logoNav">
+    <div class="logo-tab-active" onclick="toggleNav()">
+      <span class="prefix">//</span> BRAIN
+      <span class="chevron">▼</span>
+    </div>
+    <div class="nav-dropdown">
+      <a href="index.html"><span>//</span> PERFORMANCES</a>
+      <a href="logs.html"><span>//</span> LOGS</a>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="last-refresh" id="lastRefresh">—</div>
+    <button class="refresh-btn" id="refreshBtn" onclick="triggerRefresh()">↻ Refresh</button>
+  </div>
+</header>
+
+<main>
+
+  <!-- Analyses -->
+  <div class="two-col">
+    <div>
+      <div class="section-label">Analyse cyclique</div>
+      <div class="card">
+        <div id="analysisContent">
+          <div class="skeleton skel-row"></div>
+          <div class="skeleton skel-row"></div>
+          <div class="skeleton skel-row" style="width:70%"></div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="section-label">Bilan hebdomadaire</div>
+      <div class="card">
+        <div id="weeklyContent">
+          <div class="skeleton skel-row"></div>
+          <div class="skeleton skel-row"></div>
+          <div class="skeleton skel-row" style="width:70%"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Mémoire + Réflexions -->
+  <div class="two-col">
+    <div>
+      <div class="section-label">Règles mémorisées</div>
+      <div class="card">
+        <div id="memoryContent">
+          <div class="skeleton skel-row"></div>
+          <div class="skeleton skel-row"></div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="section-label">Réflexions post-trade</div>
+      <div class="table-wrap">
+        <div class="table-header">
+          <div class="table-title">Leçons tirées des SELL</div>
+          <div class="table-count" id="reflectionsCount"></div>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Symbole</th>
+                <th style="text-align:right">PnL</th>
+                <th>Leçon</th>
+                <th>Mémoire</th>
+              </tr>
+            </thead>
+            <tbody id="reflectionsBody">
+              <tr><td colspan="5" style="padding:16px"><div class="skeleton skel-row"></div></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+let ANON_KEY = localStorage.getItem('supabase_anon_key');
+if (!ANON_KEY) {
+  ANON_KEY = prompt('Entre ta clé Supabase anon key :');
+  if (ANON_KEY) localStorage.setItem('supabase_anon_key', ANON_KEY);
+}
+const _ref = JSON.parse(atob(ANON_KEY.split('.')[1])).ref;
+const API_URL = `https://${_ref}.supabase.co/functions/v1/get-portfolio`;
+
+const fmt$ = v => v == null ? '—' : '$' + Number(v).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtDate = iso => {
+  const d = new Date(iso);
+  return d.toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit' }) + ' ' +
+         d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+};
+const escapeHtml = s =>
+  String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+function formatAnalysisHtml(text) {
+  return escapeHtml(text)
+    .replace(/\[BILAN SEMAINE\]\s*/g, '')
+    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+    .replace(/^#{1,3}\s+(.+)$/gm, '<strong>$1</strong>')
+    .replace(/^(\d+\.\s+)/gm, '<br><span style="color:#444">$1</span>')
+    .replace(/\n\n/g, '<br><br>')
+    .replace(/\n/g, '<br>');
+}
+
+function renderAnalysis(analysis) {
+  const el = document.getElementById('analysisContent');
+  if (!analysis) {
+    el.innerHTML = `<p class="analysis-empty">Aucune analyse disponible — générée tous les 5 cycles.</p>`;
+    return;
+  }
+  el.innerHTML = `
+    <div class="analysis-content">${formatAnalysisHtml(analysis.analysis)}</div>
+    <div class="analysis-date">Généré le ${fmtDate(analysis.created_at)} · Cycle #${analysis.trade_count}</div>
+  `;
+}
+
+function renderWeekly(summary) {
+  const el = document.getElementById('weeklyContent');
+  if (!summary) {
+    el.innerHTML = `<p class="analysis-empty">Aucun bilan disponible — généré le vendredi.</p>`;
+    return;
+  }
+  el.innerHTML = `
+    <div class="analysis-content">${formatAnalysisHtml(summary.analysis)}</div>
+    <div class="analysis-date">Semaine du ${fmtDate(summary.created_at)} · Cycle #${summary.trade_count}</div>
+  `;
+}
+
+function renderMemory(memory) {
+  const el = document.getElementById('memoryContent');
+  if (!memory?.length) {
+    el.innerHTML = `<p class="analysis-empty">Aucune règle mémorisée — générées après les SELL.</p>`;
+    return;
+  }
+  const rules = memory.map(r => {
+    const barColor = r.importance >= 70 ? 'var(--green)' : r.importance >= 40 ? '#f5a623' : 'var(--muted)';
+    const stats = (r.times_confirmed || r.times_contradicted)
+      ? `<span style="color:var(--green)">✓${r.times_confirmed}</span>&nbsp;<span style="color:var(--red)">✗${r.times_contradicted}</span>`
+      : '';
+    return `<div class="memory-rule">
+      <div class="memory-rule-meta">
+        <div class="importance-bar" style="width:${r.importance}%;background:${barColor};"></div>
+        <span class="importance-label">${r.importance}</span>
+        <span class="memory-stats">${stats}</span>
+      </div>
+      <div class="memory-rule-content">${escapeHtml(r.content)}</div>
+    </div>`;
+  }).join('');
+  el.innerHTML = `
+    <div class="memory-count">${memory.length} règle${memory.length > 1 ? 's' : ''} active${memory.length > 1 ? 's' : ''}</div>
+    <div class="memory-list">${rules}</div>
+  `;
+}
+
+function renderReflections(reflections) {
+  const tbody = document.getElementById('reflectionsBody');
+  document.getElementById('reflectionsCount').textContent = reflections?.length ? `${reflections.length} entrées` : '';
+
+  if (!reflections?.length) {
+    tbody.innerHTML = `<tr><td colspan="5" style="padding:24px 16px;text-align:center;font-family:'JetBrains Mono',monospace;font-size:12px;color:#444;">Aucune réflexion — générées après chaque SELL</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = reflections.map(r => {
+    const pnlClass = r.pnl >= 0 ? 'pos' : 'neg';
+    const pnlStr   = (r.pnl >= 0 ? '+' : '') + fmt$(r.pnl);
+    const lesson   = escapeHtml(r.lesson || '—');
+    const isLong   = lesson.length > 60;
+    const memBadge = r.promote_to_memory
+      ? `<span class="memory-badge">→ Mémorisé</span>`
+      : `<span style="color:var(--muted);font-size:11px;">—</span>`;
+    return `<tr>
+      <td class="td-time">${fmtDate(r.created_at)}</td>
+      <td><span class="badge-symbol">${escapeHtml(r.symbol)}</span></td>
+      <td class="td-pnl ${pnlClass}" style="text-align:right">${pnlStr}</td>
+      <td class="td-lesson ${isLong ? 'expandable' : ''}" onclick="this.classList.toggle('expanded')">${lesson}</td>
+      <td>${memBadge}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadAll() {
+  const data = await fetch(API_URL, {
+    headers: { Authorization: `Bearer ${ANON_KEY}` }
+  }).then(r => r.json()).catch(() => null);
+
+  if (!data) return;
+
+  renderAnalysis(data.analysis ?? null);
+  renderWeekly(data.weekly_summary ?? null);
+  renderMemory(data.memory ?? []);
+  renderReflections(data.reflections ?? []);
+
+  const now = new Date();
+  document.getElementById('lastRefresh').textContent =
+    `Actualisé à ${now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`;
+}
+
+function triggerRefresh() {
+  const btn = document.getElementById('refreshBtn');
+  btn.classList.add('spinning');
+  loadAll().finally(() => btn.classList.remove('spinning'));
+}
+
+function toggleNav() {
+  document.getElementById('logoNav').classList.toggle('open');
+}
+document.addEventListener('click', e => {
+  if (!document.getElementById('logoNav').contains(e.target))
+    document.getElementById('logoNav').classList.remove('open');
+});
+
+loadAll();
+</script>
+
+</body>
+</html>

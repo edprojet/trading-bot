@@ -84,6 +84,58 @@
     }
     .back-link:hover { color: var(--text); }
 
+    .logo-nav { position: relative; }
+
+    .logo-tab-active {
+      font-family: 'JetBrains Mono', monospace;
+      font-weight: 600;
+      font-size: 13px;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+      color: var(--white);
+      cursor: pointer;
+      user-select: none;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .logo-tab-active span.prefix { color: var(--green); }
+    .logo-tab-active .chevron {
+      font-size: 9px;
+      color: var(--muted);
+      transition: transform .2s;
+    }
+    .logo-nav.open .chevron { transform: rotate(180deg); }
+
+    .nav-dropdown {
+      display: none;
+      position: absolute;
+      top: calc(100% + 10px);
+      left: 0;
+      background: #111;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+      min-width: 160px;
+      z-index: 200;
+    }
+    .logo-nav.open .nav-dropdown { display: block; }
+
+    .nav-dropdown a {
+      display: block;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+      color: var(--muted);
+      text-decoration: none;
+      padding: 10px 16px;
+      transition: color .15s, background .15s;
+    }
+    .nav-dropdown a span { color: var(--green); }
+    .nav-dropdown a:hover { color: var(--white); background: rgba(255,255,255,.03); }
+
     .header-right { display: flex; align-items: center; gap: 12px; }
 
     .last-refresh {
@@ -318,9 +370,15 @@
 <body>
 
 <header>
-  <div class="header-left">
-    <div class="logo"><span>//</span> LOGS</div>
-    <a href="index.html" class="back-link">← Dashboard</a>
+  <div class="logo-nav" id="logoNav">
+    <div class="logo-tab-active" onclick="toggleNav()">
+      <span class="prefix">//</span> LOGS
+      <span class="chevron">▼</span>
+    </div>
+    <div class="nav-dropdown">
+      <a href="index.html"><span>//</span> PERFORMANCES</a>
+      <a href="brain.html"><span>//</span> BRAIN</a>
+    </div>
   </div>
   <div class="header-right">
     <div class="countdown" id="countdown">
@@ -423,8 +481,8 @@ function humanResult(r) {
       if (!trades.length) return { label: 'HOLD — Grok ne voit pas d\'opportunité ce cycle', cls: OK };
       const parts = trades.map(d =>
         d.action === 'BUY'
-          ? `Achat de ${d.quantity} ${d.symbol}`
-          : `Vente de ${d.quantity} ${d.symbol}`
+          ? `Achat de ${escapeHtml(String(d.quantity))} ${escapeHtml(d.symbol)}`
+          : `Vente de ${escapeHtml(String(d.quantity))} ${escapeHtml(d.symbol)}`
       );
       return { label: parts.join(' + '), cls: OK };
     }
@@ -524,6 +582,14 @@ function triggerRefresh() {
   btn.classList.add('spinning');
   loadAll().finally(() => btn.classList.remove('spinning'));
 }
+
+function toggleNav() {
+  document.getElementById('logoNav').classList.toggle('open');
+}
+document.addEventListener('click', e => {
+  if (!document.getElementById('logoNav').contains(e.target))
+    document.getElementById('logoNav').classList.remove('open');
+});
 
 loadAll();
 </script>
