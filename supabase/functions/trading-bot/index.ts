@@ -225,6 +225,67 @@ async function logTrade(trade: Record<string, unknown>) {
   await supabase.from("trades").insert(trade);
 }
 
+function getRunSource(req: Request): string {
+  const ua = (req.headers.get("user-agent") ?? "").toLowerCase();
+  if (ua.includes("pg_net") || ua.includes("postgresql")) return "cron";
+  return "manual";
+}
+
+function buildHumanMessage(status: string, details?: Record<string, unknown>): string {
+  if (status === "market_closed") return "Marché fermé — aucune action";
+  if (status === "already_running") return "Cycle ignoré — un autre cycle était déjà en cours";
+  if (status === "grok_parse_error") return "Erreur IA — Grok n'a pas retourné une réponse exploitable";
+  if (status === "error") {
+    const msg = typeof details?.message === "string" ? details.message : "erreur inconnue";
+    return `Crash de la fonction : ${msg}`;
+  }
+
+  if (status === "ok") {
+    const decisions = Array.isArray(details?.decisions)
+      ? (details?.decisions as Array<Record<string, unknown>>)
+      : [];
+    const trades = decisions.filter((d) => d.action === "BUY" || d.action === "SELL");
+    if (!trades.length) return "HOLD — aucune opportunité détectée";
+
+    return trades.map((d) => {
+      const action = String(d.action);
+      const qty = d.quantity ?? "?";
+      const symbol = d.symbol ?? "?";
+      return action === "BUY"
+        ? `Achat de ${qty} ${symbol}`
+        : `Vente de ${qty} ${symbol}`;
+    }).join(" + ");
+  }
+
+  return `Statut ${status}`;
+}
+
+function getSeverity(status: string): "ok" | "warn" | "error" {
+  if (status === "ok" || status === "market_closed") return "ok";
+  if (status === "already_running") return "warn";
+  return "error";
+}
+
+async function logExecutionEvent(
+  req: Request,
+  status: string,
+  httpStatus: number,
+  details?: Record<string, unknown>
+) {
+  try {
+    await supabase.from("bot_execution_logs").insert({
+      run_source: getRunSource(req),
+      bot_status: status,
+      severity: getSeverity(status),
+      human_message: buildHumanMessage(status, details),
+      http_status: httpStatus,
+      details: details ?? null,
+    });
+  } catch (err) {
+    console.error("logExecutionEvent() failed:", err);
+  }
+}
+
 async function closeBuyTrade(symbol: string, priceExit: number) {
   const { data } = await supabase
     .from("trades")
@@ -981,11 +1042,27 @@ Retourne TOUTES les décisions originales (y compris les HOLD non modifiées).`;
 // ---------------------------------------------------------------------------
 
 Deno.serve(async (req) => {
-  // Vérifier que le JWT est bien service_role ET émis par ce projet Supabase.
+  // Vérification JWT stricte (format Bearer + scope projet + rôle + expiration)
   try {
-    const token = (req.headers.get("Authorization") ?? "").replace("Bearer ", "");
-    const payload = JSON.parse(atob(token.split(".")[1]));
-    if (payload.role !== "service_role" || payload.ref !== "bhumjspdeveqybkilcxc") {
+    const auth = req.headers.get("Authorization") ?? "";
+    if (!auth.startsWith("Bearer ")) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
+    }
+    const token = auth.slice(7).trim();
+    const parts = token.split(".");
+    if (parts.length !== 3) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
+    }
+    const payload = JSON.parse(atob(parts[1]));
+    const now = Math.floor(Date.now() / 1000);
+    const exp = Number(payload?.exp);
+    if (
+      payload?.role !== "service_role" ||
+      payload?.ref !== "bhumjspdeveqybkilcxc" ||
+      payload?.iss !== "supabase" ||
+      !Number.isFinite(exp) ||
+      exp <= now
+    ) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
     }
   } catch {
@@ -996,6 +1073,7 @@ Deno.serve(async (req) => {
   const { data: claimed } = await supabase.rpc("try_claim_bot_run");
   if (!claimed) {
     console.log("Bot already running — skipping.");
+    await logExecutionEvent(req, "already_running", 200);
     return new Response(JSON.stringify({ status: "already_running" }), { status: 200 });
   }
 
@@ -1005,6 +1083,7 @@ Deno.serve(async (req) => {
     if (!marketOpen) {
       console.log("Market closed — skipping.");
       await supabase.rpc("release_bot_run");
+      await logExecutionEvent(req, "market_closed", 200);
       return new Response(JSON.stringify({ status: "market_closed" }), { status: 200 });
     }
 
@@ -1066,6 +1145,10 @@ Deno.serve(async (req) => {
     const rawDecisions = await makeDecision(account, positionsAfterStopLoss, history, marketData, analyses.cyclic, analyses.weekly, cycleCount, marketContext, earnings, botMemory);
     if (!rawDecisions) {
       await supabase.rpc("release_bot_run");
+      await logExecutionEvent(req, "grok_parse_error", 200, {
+        cycle_count: cycleCount,
+        symbols,
+      });
       return new Response(JSON.stringify({ status: "grok_parse_error" }), { status: 200 });
     }
 
@@ -1148,10 +1231,18 @@ Deno.serve(async (req) => {
     }
 
     await supabase.rpc("release_bot_run");
+    await logExecutionEvent(req, "ok", 200, {
+      cycle_count: cycleCount,
+      decisions,
+      raw_decisions: rawDecisions,
+      executed_orders_count: executedOrders.length,
+      stop_loss_orders_count: stopLossOrders.length,
+    });
     return new Response(JSON.stringify({ status: "ok", rawDecisions, decisions, executedOrders }), { status: 200 });
   } catch (err) {
     console.error(err);
     await supabase.rpc("release_bot_run");
+    await logExecutionEvent(req, "error", 500, { message: String(err) });
     return new Response(JSON.stringify({ status: "error", message: String(err) }), { status: 500 });
   }
 });

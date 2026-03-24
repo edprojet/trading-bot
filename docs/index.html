@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Performances</title>
+  <title>Perf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -544,7 +544,7 @@
 <header>
   <div class="logo-nav" id="logoNav">
     <div class="logo-tab-active" onclick="toggleNav()">
-      <span class="prefix">//</span> PERFORMANCES
+      <span class="prefix">//</span> PERF
       <span class="chevron">▼</span>
     </div>
     <div class="nav-dropdown">
@@ -575,7 +575,6 @@
   </div>
 
   <!-- STATS -->
-  <div class="section-label" style="margin-top:16px">Vue d'ensemble</div>
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-label">Valeur portfolio</div>
@@ -847,8 +846,11 @@ async function loadAll() {
 
   const closedTrades = trades.filter(t => t.pnl != null);
   const totalPnl = data?.total_realized_pnl ?? closedTrades.reduce((s, t) => s + (t.pnl || 0), 0);
-  const winCount = closedTrades.filter(t => t.pnl > 0).length;
-  const winRate  = closedTrades.length ? (winCount / closedTrades.length) * 100 : null;
+  const totalClosedCount = Number.isFinite(data?.closed_trade_count) ? data.closed_trade_count : closedTrades.length;
+  const winCount = Number.isFinite(data?.winning_trade_count)
+    ? data.winning_trade_count
+    : closedTrades.filter(t => t.pnl > 0).length;
+  const winRate  = totalClosedCount ? (winCount / totalClosedCount) * 100 : null;
 
   document.getElementById('statEquity').textContent = fmt$(equity);
   document.getElementById('statCash').textContent   = fmt$(cash);
@@ -857,8 +859,10 @@ async function loadAll() {
   pnlEl.textContent = totalPnl >= 0 ? '+' + fmt$(totalPnl) : fmt$(totalPnl);
   pnlEl.className = `stat-value ${totalPnl > 0 ? 'positive' : totalPnl < 0 ? 'negative' : ''}`;
 
-  const unrealizedPnl = parseFloat(data?.account?.unrealized_pl ?? 0);
   const positions = Array.isArray(data?.positions) ? data.positions : [];
+  const positionsUnrealized = positions.reduce((sum, p) => sum + (Number(p?.unrealized_pl) || 0), 0);
+  const unrealizedFromApi = Number(data?.live_unrealized_pnl);
+  const unrealizedPnl = Number.isFinite(unrealizedFromApi) ? unrealizedFromApi : positionsUnrealized;
   const unrealizedEl = document.getElementById('statUnrealizedPnl');
   unrealizedEl.textContent = unrealizedPnl >= 0 ? '+' + fmt$(unrealizedPnl) : fmt$(unrealizedPnl);
   unrealizedEl.className = `stat-value ${unrealizedPnl > 0 ? 'positive' : unrealizedPnl < 0 ? 'negative' : ''}`;
@@ -867,8 +871,8 @@ async function loadAll() {
     : 'Aucune position ouverte';
 
   document.getElementById('statWinRate').textContent = fmtPct(winRate);
-  document.getElementById('statWinRateSub').textContent = closedTrades.length
-    ? `${winCount} gagnants / ${closedTrades.length} fermés`
+  document.getElementById('statWinRateSub').textContent = totalClosedCount
+    ? `${winCount} gagnants / ${totalClosedCount} fermés`
     : 'Aucun trade fermé';
 
   if (snapshots.length) renderChart(snapshots);
@@ -876,7 +880,7 @@ async function loadAll() {
 }
 
 loadAll();
-setInterval(loadAll, 2 * 60 * 1000);
+setInterval(loadAll, 30 * 1000);
 
 function toggleNav() {
   document.getElementById('logoNav').classList.toggle('open');

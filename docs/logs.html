@@ -161,6 +161,17 @@
     .refresh-btn.spinning { animation: spin .6s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
 
+    .date-filter {
+      height: 28px;
+      background: #111;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0 8px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+    }
+
     /* ── MAIN ── */
     main { max-width: 1400px; margin: 0 auto; padding: 32px 32px 0; }
 
@@ -376,11 +387,13 @@
       <span class="chevron">▼</span>
     </div>
     <div class="nav-dropdown">
-      <a href="index.html"><span>//</span> PERFORMANCES</a>
+      <a href="index.html"><span>//</span> PERF</a>
       <a href="brain.html"><span>//</span> BRAIN</a>
     </div>
   </div>
   <div class="header-right">
+    <input type="date" id="logDateFilter" class="date-filter" />
+    <button class="refresh-btn" id="clearDateBtn" onclick="clearDateFilter()">Tous</button>
     <div class="countdown" id="countdown">
       <span id="countdownText">30s</span>
       <div class="countdown-bar"><div class="countdown-fill" id="countdownFill" style="width:100%"></div></div>
@@ -433,6 +446,7 @@ if (!ANON_KEY) {
 const _ref = JSON.parse(atob(ANON_KEY.split('.')[1])).ref;
 const API_URL = `https://${_ref}.supabase.co/functions/v1/get-logs`;
 const REFRESH_INTERVAL = 30;
+let selectedDate = null;
 
 // ── Formatters ────────────────────────────────────────────────────────────────
 const fmtDate = iso => {
@@ -457,6 +471,11 @@ const OK  = 'result-buy';   // vert  — tout va bien
 const ERR = 'result-error'; // rouge — action requise
 
 function humanResult(r) {
+  if (r?.human_message && r?.severity) {
+    const cls = r.severity === 'ok' ? OK : r.severity === 'warn' ? 'result-warn' : ERR;
+    return { label: escapeHtml(r.human_message), cls };
+  }
+
   if (r.timed_out)        return { label: 'Timeout — la fonction a mis trop longtemps à répondre', cls: ERR };
   if (!r.http_status)     return { label: 'Pas de réponse — la fonction n\'a pas répondu du tout', cls: ERR };
   if (r.http_status === 401) return { label: 'Accès refusé — clé d\'authentification invalide', cls: ERR };
@@ -494,6 +513,7 @@ function humanResult(r) {
 const PAGE_SIZE = 40;
 let allRuns = [];
 let currentPage = 0;
+let totalCyclesFromApi = null;
 
 function renderPage() {
   const tbody = document.getElementById('runsBody');
@@ -502,11 +522,16 @@ function renderPage() {
   const start = currentPage * PAGE_SIZE;
   const page = allRuns.slice(start, start + PAGE_SIZE);
 
-  document.getElementById('runsCount').textContent = `${total} cycles`;
+  if (Number.isFinite(totalCyclesFromApi) && totalCyclesFromApi >= 0) {
+    document.getElementById('runsCount').textContent = `${totalCyclesFromApi} cycles`;
+  } else {
+    document.getElementById('runsCount').textContent = `${total} cycles`;
+  }
 
   tbody.innerHTML = page.map(r => {
     const { label, cls } = humanResult(r);
-    const rawLog = escapeHtml(r.http_content ?? r.error ?? '—');
+    const rawFromDetails = r?.details ? JSON.stringify(r.details) : null;
+    const rawLog = escapeHtml(rawFromDetails ?? r.http_content ?? r.error ?? '—');
     const isLong = rawLog.length > 60;
     return `<tr>
       <td class="td-time">${fmtDate(r.started_at)}</td>
@@ -537,11 +562,38 @@ function renderRuns(runs) {
   if (!runs.length) {
     document.getElementById('runsBody').innerHTML = `<tr><td colspan="3" style="padding:24px 16px; text-align:center; font-family:'JetBrains Mono',monospace; font-size:12px; color:#444">Aucun cycle enregistré</td></tr>`;
     document.getElementById('runsCount').textContent = '0 cycles';
+    document.getElementById('pagination').style.display = 'none';
     return;
   }
   allRuns = runs;
   currentPage = 0;
   renderPage();
+}
+
+function renderApiError(message) {
+  document.getElementById('runsBody').innerHTML = `<tr><td colspan="3" style="padding:24px 16px; text-align:center; font-family:'JetBrains Mono',monospace; font-size:12px; color:#ff3d5a">${escapeHtml(message)}</td></tr>`;
+  document.getElementById('runsCount').textContent = 'Erreur';
+  document.getElementById('pagination').style.display = 'none';
+}
+
+function buildDateQuery() {
+  if (!selectedDate) return '';
+  const startLocal = new Date(`${selectedDate}T00:00:00`);
+  if (Number.isNaN(startLocal.getTime())) return '';
+  const endLocal = new Date(startLocal);
+  endLocal.setDate(endLocal.getDate() + 1);
+  const params = new URLSearchParams({
+    from: startLocal.toISOString(),
+    to: endLocal.toISOString(),
+  });
+  return `?${params.toString()}`;
+}
+
+function clearDateFilter() {
+  selectedDate = null;
+  const input = document.getElementById('logDateFilter');
+  if (input) input.value = '';
+  loadAll();
 }
 
 
@@ -564,12 +616,24 @@ function startCountdown() {
 async function loadAll() {
   startCountdown();
 
-  const data = await fetch(API_URL, {
+  const res = await fetch(`${API_URL}${buildDateQuery()}`, {
     headers: { Authorization: `Bearer ${ANON_KEY}` }
-  }).then(r => r.json()).catch(() => null);
+  }).catch(() => null);
 
-  if (!data) return;
+  if (!res) {
+    renderApiError("Impossible de contacter l'API logs.");
+    return;
+  }
 
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data || data.error) {
+    const statusText = `HTTP ${res.status}`;
+    const message = data?.error ? `${statusText} — ${data.error}` : `${statusText} — réponse invalide`;
+    renderApiError(`Chargement des logs impossible: ${message}`);
+    return;
+  }
+
+  totalCyclesFromApi = Number.isFinite(data?.total_cycles) ? data.total_cycles : null;
   renderRuns(data.runs ?? []);
 
   const now = new Date();
@@ -589,6 +653,11 @@ function toggleNav() {
 document.addEventListener('click', e => {
   if (!document.getElementById('logoNav').contains(e.target))
     document.getElementById('logoNav').classList.remove('open');
+});
+
+document.getElementById('logDateFilter')?.addEventListener('change', (e) => {
+  selectedDate = e.target.value || null;
+  loadAll();
 });
 
 loadAll();

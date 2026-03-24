@@ -13,17 +13,36 @@ const corsHeaders = {
 };
 
 const SUPABASE_REF = "bhumjspdeveqybkilcxc";
+const ALLOWED_ROLES = new Set(["anon", "authenticated", "service_role"]);
+
+function isValidDashboardToken(req: Request): boolean {
+  const auth = req.headers.get("Authorization") ?? "";
+  if (!auth.startsWith("Bearer ")) return false;
+  const token = auth.slice(7).trim();
+  if (!token) return false;
+
+  const parts = token.split(".");
+  if (parts.length !== 3) return false;
+
+  const payload = JSON.parse(atob(parts[1]));
+  const exp = Number(payload?.exp);
+  const role = String(payload?.role ?? "");
+  const now = Math.floor(Date.now() / 1000);
+
+  if (payload?.iss !== "supabase" || payload?.ref !== SUPABASE_REF) return false;
+  if (!ALLOWED_ROLES.has(role)) return false;
+  if (!Number.isFinite(exp) || exp <= now) return false;
+  return true;
+}
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
 
-  // Vérifier que le JWT est bien émis par ce projet Supabase
+  // Vérification JWT stricte (format, scope projet, rôle autorisé, expiration)
   try {
-    const token = (req.headers.get("Authorization") ?? "").replace("Bearer ", "");
-    const payload = JSON.parse(atob(token.split(".")[1]));
-    if (payload.iss !== "supabase" || payload.ref !== SUPABASE_REF) {
+    if (!isValidDashboardToken(req)) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401, headers: corsHeaders });
     }
   } catch {
@@ -48,16 +67,35 @@ Deno.serve(async (req) => {
     supabase.from("trade_reflections").select("symbol, pnl, lesson, rule_derived, promote_to_memory, created_at").order("created_at", { ascending: false }).limit(10),
   ]);
 
-  const totalRealizedPnl = (allPnlRes.data ?? []).reduce((s: number, t: { pnl: number }) => s + (t.pnl || 0), 0);
+  const allClosedTrades = (allPnlRes.data ?? []) as Array<{ pnl: number | null }>;
+  const closedTradeCount = allClosedTrades.length;
+  const winningTradeCount = allClosedTrades.filter((t) => (t.pnl ?? 0) > 0).length;
+  const totalRealizedPnl = allClosedTrades.reduce((s: number, t) => s + (t.pnl || 0), 0);
+  const safeAccount =
+    account && typeof account === "object" && !("code" in account)
+      ? account as Record<string, unknown>
+      : null;
+  const safePositions = Array.isArray(positions) ? positions : [];
+  const parseNum = (v: unknown) => {
+    const n = typeof v === "number" ? v : Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const positionsUnrealized = safePositions.reduce((sum: number, p: Record<string, unknown>) => {
+    return sum + (parseNum(p.unrealized_pl) ?? 0);
+  }, 0);
+  const liveUnrealizedPnl = parseNum(safeAccount?.unrealized_pl) ?? positionsUnrealized;
 
   return new Response(
     JSON.stringify({
-      account,
-      positions,
+      account:            safeAccount,
+      positions:          safePositions,
       market_open:        clock?.is_open ?? false,
       snapshots:          snapshotsRes.data    ?? [],
       trades:             tradesRes.data       ?? [],
       total_realized_pnl: totalRealizedPnl,
+      closed_trade_count: closedTradeCount,
+      winning_trade_count: winningTradeCount,
+      live_unrealized_pnl: liveUnrealizedPnl,
       analysis:           analysisRes.data     ?? null,
       weekly_summary:     weeklyRes.data       ?? null,
       memory:             memoryRes.data       ?? [],
