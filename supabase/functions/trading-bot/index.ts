@@ -67,7 +67,7 @@ async function placeOrder(symbol: string, qty: number, side: "buy" | "sell") {
 // Helpers Alpaca — Données de marché
 // ---------------------------------------------------------------------------
 
-type Bar = { c: number; v: number };
+type Bar = { c: number; h: number; l: number; v: number };
 type TechData = {
   price: number;
   change_pct: number;
@@ -78,6 +78,7 @@ type TechData = {
   macd: number | null;
   macd_signal: number | null;
   macd_hist: number | null;
+  atr14: number | null;
 };
 
 function sma(arr: number[]): number {
@@ -112,7 +113,7 @@ async function computeTechnicals(symbol: string): Promise<TechData & { symbol: s
   const closes = bars.map((b) => b.c);
 
   if (closes.length < 2) {
-    return { symbol, price: 0, change_pct: 0, volume: 0, sma20: null, sma50: null, rsi14: null, macd: null, macd_signal: null, macd_hist: null };
+    return { symbol, price: 0, change_pct: 0, volume: 0, sma20: null, sma50: null, rsi14: null, macd: null, macd_signal: null, macd_hist: null, atr14: null };
   }
 
   const last = closes[closes.length - 1];
@@ -147,6 +148,22 @@ async function computeTechnicals(symbol: string): Promise<TechData & { symbol: s
     macdHist = +(macdVal - macdSignal).toFixed(4);
   }
 
+  // ATR(14) sur les barres 15min
+  let atr14: number | null = null;
+  if (bars.length >= 15) {
+    const trueRanges: number[] = [];
+    for (let i = 1; i < bars.length; i++) {
+      const prevClose = bars[i - 1].c;
+      const tr = Math.max(
+        bars[i].h - bars[i].l,
+        Math.abs(bars[i].h - prevClose),
+        Math.abs(bars[i].l - prevClose)
+      );
+      trueRanges.push(tr);
+    }
+    atr14 = +sma(trueRanges.slice(-14)).toFixed(4);
+  }
+
   return {
     symbol,
     price: +last.toFixed(2),
@@ -158,6 +175,7 @@ async function computeTechnicals(symbol: string): Promise<TechData & { symbol: s
     macd: macdVal,
     macd_signal: macdSignal,
     macd_hist: macdHist,
+    atr14,
   };
 }
 
@@ -552,6 +570,10 @@ async function generateAndSaveAnalysis(
   const totalPnl = closedTrades.reduce((s: number, t: Record<string, unknown>) => s + ((t.pnl as number) || 0), 0);
   const holdCount = lastDecisions.filter((t: Record<string, unknown>) => t.action === "HOLD").length;
   const holdRate = Math.round((holdCount / lastDecisions.length) * 100);
+  const equityNum = parseFloat(String(account.equity));
+  const distanceToFloor = (equityNum - 85000).toFixed(0);
+  const distancePct = (((equityNum - 85000) / equityNum) * 100).toFixed(1);
+  const drawdownPct = (((100000 - equityNum) / 100000) * 100).toFixed(2);
 
   const positionsStr = (positions as Record<string, unknown>[]).length
     ? (positions as Record<string, unknown>[]).map(p =>
@@ -565,13 +587,15 @@ async function generateAndSaveAnalysis(
 
 ## État du portfolio (maintenant)
 - Equity totale : $${account.equity} | Cash disponible : $${account.cash}
+- Drawdown depuis $100 000 : -${drawdownPct}%
+- Distance au floor ($85 000) : $${distanceToFloor} restants (${distancePct}% de marge) — ${parseFloat(distancePct) > 10 ? "LOIN du floor, agir normalement" : parseFloat(distancePct) > 5 ? "marge modérée, rester prudent" : "PROCHE du floor, prudence maximale"}
 - Positions ouvertes :
 ${positionsStr}
 
 ## Métriques sur les 20 dernières décisions
 - PnL réalisé total : ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}
 - Win rate : ${winRate !== null ? `${winRate}% (${winCount} gagnants / ${closedTrades.length} trades clôturés)` : "Aucun trade clôturé"}
-- Ratio HOLD : ${holdRate}% des décisions (${holdCount}/${lastDecisions.length})
+- Ratio HOLD : ${holdRate}% des décisions (${holdCount}/${lastDecisions.length}) — cible : < 30%
 
 ## 20 dernières décisions (récent → ancien)
 ${JSON.stringify(lastDecisions, null, 2)}
@@ -591,6 +615,8 @@ ${previousCyclic
 3. **Décisions discutables** : quelles décisions auraient pu être différentes
 4. **Patterns identifiés** : tendances récurrentes (ex: trop de HOLD, entrées trop tôt, mauvais timing...)
 5. **Ajustements concrets** : ce que tu vas changer dans les prochains cycles`}
+
+${parseFloat(distancePct) > 10 ? "⚠️ Distance au floor > 10% : NE PAS recommander de prudence accrue ni de 'capital preservation'. Recommander au contraire d'augmenter l'activité et l'allocation." : ""}
 
 Sois concis, factuel et actionnable. Cette analyse sera injectée dans tes prochains prompts de décision.`;
 
@@ -918,6 +944,7 @@ ${marketContext}
 ## Portfolio actuel
 - Cash disponible : $${account.cash}
 - Valeur totale : $${account.equity}
+- Distance au floor ($85 000) : $${(parseFloat(String(account.equity)) - 85000).toFixed(0)} restants (${(((parseFloat(String(account.equity)) - 85000) / parseFloat(String(account.equity))) * 100).toFixed(1)}% de marge)
 - Positions ouvertes (avec PnL non réalisé) :
 ${(positions as Record<string, unknown>[]).map((p) =>
   `  ${p.symbol}: ${p.qty} actions | Prix moyen : $${p.avg_entry_price} | Prix actuel : $${p.current_price} | PnL : $${p.unrealized_pl} (${parseFloat(String(p.unrealized_plpc ?? 0) ) > 0 ? "+" : ""}${(parseFloat(String(p.unrealized_plpc ?? 0)) * 100).toFixed(2)}%)`
@@ -931,10 +958,16 @@ ${JSON.stringify(history, null, 2)}
 ${cyclicAnalysis ? `\n## Ton analyse de performance (version actuelle)\n${cyclicAnalysis}\n` : ""}${weeklyAnalysis ? `\n## Ton bilan hebdomadaire (version actuelle)\n${weeklyAnalysis}\n` : ""}
 ## Instructions
 1. Scanne X, Reddit et les news financières en ce moment
-2. Applique le raisonnement en 3 étapes (positions → marché → portfolio)
-3. Retourne TOUTES tes décisions pour ce cycle
+2. Raisonne à voix haute avant de décider — écris ton analyse pour chaque symbole :
+   - Bull case : pourquoi acheter / garder
+   - Bear case : pourquoi éviter / vendre
+   - Verdict : décision et sizing
+3. Après ton raisonnement, retourne TOUTES tes décisions en JSON
 
-Réponds UNIQUEMENT en JSON valide (tableau), sans markdown :
+Réponds dans ce format EXACT (raisonnement libre puis JSON) :
+<reasoning>
+[Ton analyse bull/bear/verdict par symbole ici — texte libre]
+</reasoning>
 [
   {
     "action": "BUY" | "SELL" | "HOLD",
@@ -1111,27 +1144,55 @@ Deno.serve(async (req) => {
       getMarketContext(),
     ]);
 
-    // 7. Stop-loss hard — SELL forcé si position à -8% ou pire (sans consulter Grok)
+    // 7. Stop-loss ATR-based — SELL forcé si position dépasse le seuil dynamique (sans consulter Grok)
+    // Seuil = 4x ATR(14) 15min depuis le prix d'entrée, min 1%, max 8% (fallback -8% fixe si ATR indisponible)
+    // Trailing stop : si position en gain > +5%, le stop remonte au prix d'entrée (break-even)
     const stopLossOrders: Array<{ symbol: string; qty: number }> = [];
     for (const pos of positions as Record<string, unknown>[]) {
       const plpc = parseFloat(String(pos.unrealized_plpc ?? 0));
-      if (plpc <= -STOP_LOSS_PCT) {
-        console.warn(`STOP-LOSS déclenché sur ${pos.symbol} (${(plpc * 100).toFixed(2)}%)`);
+      const entryPrice = parseFloat(String(pos.avg_entry_price ?? 0));
+      const currentPrice = parseFloat(String(pos.current_price ?? 0));
+      const posAtr = marketData[pos.symbol as string]?.tech?.atr14 ?? null;
+
+      // Calcul du seuil de stop dynamique
+      let stopThresholdPct: number;
+      let stopReason: string;
+
+      if (plpc >= 0.05 && currentPrice < entryPrice) {
+        // Trailing stop : position était en gain > 5%, est revenue sous le prix d'entrée → SELL
+        stopThresholdPct = 0;
+        stopReason = `TRAILING STOP déclenché — position retombée sous le prix d'entrée ($${entryPrice}) après avoir été en gain > +5%`;
+      } else if (posAtr && entryPrice > 0) {
+        // ATR-based stop : 4x ATR depuis le prix d'entrée, borné entre 1% et 8%
+        const atrStopPct = Math.min(Math.max((4 * posAtr) / entryPrice, 0.01), STOP_LOSS_PCT);
+        stopThresholdPct = -atrStopPct;
+        stopReason = `STOP-LOSS ATR déclenché à ${(plpc * 100).toFixed(2)}% (seuil : -${(atrStopPct * 100).toFixed(2)}%, ATR=${posAtr.toFixed(4)})`;
+      } else {
+        // Fallback fixe -8%
+        stopThresholdPct = -STOP_LOSS_PCT;
+        stopReason = `STOP-LOSS automatique déclenché à ${(plpc * 100).toFixed(2)}% de perte (seuil fixe -${(STOP_LOSS_PCT * 100).toFixed(0)}%)`;
+      }
+
+      const shouldStop = plpc >= 0.05
+        ? (currentPrice < entryPrice)
+        : (plpc <= stopThresholdPct);
+
+      if (shouldStop) {
+        console.warn(`STOP-LOSS déclenché sur ${pos.symbol} (${(plpc * 100).toFixed(2)}%) — ${stopReason}`);
         const qty = parseInt(String(pos.qty), 10);
         const alpacaOrder = await placeOrder(pos.symbol as string, qty, "sell");
         if (alpacaOrder?.code || alpacaOrder?.message) {
           console.error("Alpaca STOP-LOSS rejected:", alpacaOrder);
-          await logTrade({ symbol: pos.symbol, action: "SELL_REJECTED", quantity: qty, reason: `STOP-LOSS automatique (-${(plpc * 100).toFixed(2)}%) — rejeté par Alpaca: ${JSON.stringify(alpacaOrder)}`, status: "error" });
+          await logTrade({ symbol: pos.symbol, action: "SELL_REJECTED", quantity: qty, reason: `${stopReason} — rejeté par Alpaca: ${JSON.stringify(alpacaOrder)}`, status: "error" });
         } else {
-          const priceExit = await getLatestPrice(pos.symbol as string) || parseFloat(String(pos.current_price ?? 0));
+          const priceExit = await getLatestPrice(pos.symbol as string) || currentPrice;
           if (priceExit) await closeBuyTrade(pos.symbol as string, priceExit);
-          const stopLossReason = `STOP-LOSS automatique déclenché à ${(plpc * 100).toFixed(2)}% de perte`;
-          await logTrade({ symbol: pos.symbol, action: "SELL", quantity: qty, reason: stopLossReason, price_entry: priceExit, alpaca_order_id: alpacaOrder?.id ?? null, status: "closed" });
+          await logTrade({ symbol: pos.symbol, action: "SELL", quantity: qty, reason: stopReason, price_entry: priceExit, alpaca_order_id: alpacaOrder?.id ?? null, status: "closed" });
           stopLossOrders.push({ symbol: pos.symbol as string, qty });
           // Réflexion post-trade sur le stop-loss
           const stopLossPnl = parseFloat(String(pos.unrealized_pl ?? 0));
           const entryReasonForStop = history.find((t: Record<string, unknown>) => t.symbol === pos.symbol && t.action === "BUY")?.reason as string ?? "raison inconnue";
-          await reflectOnClosedTrade(pos.symbol as string, stopLossPnl, entryReasonForStop, stopLossReason);
+          await reflectOnClosedTrade(pos.symbol as string, stopLossPnl, entryReasonForStop, stopReason);
         }
       }
     }
