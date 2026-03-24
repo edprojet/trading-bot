@@ -846,7 +846,7 @@ async function loadAll() {
   const cash   = data?.account?.cash   ?? latest?.cash;
 
   const closedTrades = trades.filter(t => t.pnl != null);
-  const totalPnl = closedTrades.reduce((s, t) => s + (t.pnl || 0), 0);
+  const totalPnl = data?.total_realized_pnl ?? closedTrades.reduce((s, t) => s + (t.pnl || 0), 0);
   const winCount = closedTrades.filter(t => t.pnl > 0).length;
   const winRate  = closedTrades.length ? (winCount / closedTrades.length) * 100 : null;
 
